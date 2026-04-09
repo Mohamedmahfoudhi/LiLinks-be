@@ -2,15 +2,11 @@ const express = require('express');
 const router = express.Router();
 const pool = require('../db/pool');
 const {
-    generateCards,
     decodeToken,
     verifySignature,
-    getCardsByBatch,
-    disableCard,
-    disableBatch,
-    VALID_VALUES,
 } = require('../modules/generateCards');
-const { generateCardsPDF } = require('../modules/pdfExport');
+const { authenticate } = require('../middleware/auth');
+const { recordCardRedemption } = require('../services/transactionService');
 
 /**
  * Logs an audit event to the database
@@ -59,73 +55,16 @@ function getClientIP(req) {
 }
 
 /**
- * POST /api/cards/generate
- * Generate a batch of QR cards
- *
- * Body: { quantity: number, value: 10|50|100|200, expiresInDays: number }
- */
-router.post('/generate', async (req, res) => {
-    try {
-        const { quantity, value, expiresInDays } = req.body;
-
-        if (!quantity || !value || !expiresInDays) {
-            return res.status(400).json({
-                success: false,
-                error: 'Missing required fields: quantity, value, expiresInDays',
-            });
-        }
-
-        const result = await generateCards({
-            quantity: parseInt(quantity, 10),
-            value: parseInt(value, 10),
-            expiresInDays: parseInt(expiresInDays, 10),
-        });
-
-        await logAuditEvent({
-            eventType: 'CARDS_GENERATED',
-            ipAddress: getClientIP(req),
-            userAgent: req.headers['user-agent'],
-            requestPayload: { quantity, value, expiresInDays },
-            responseStatus: 'SUCCESS',
-            metadata: { batchId: result.batchId, count: result.quantity },
-        });
-
-        res.json({
-            success: true,
-            batchId: result.batchId,
-            quantity: result.quantity,
-            value: result.value,
-            expiresAt: result.expiresAt,
-            cards: result.cards,
-        });
-    } catch (error) {
-        await logAuditEvent({
-            eventType: 'CARDS_GENERATED',
-            ipAddress: getClientIP(req),
-            userAgent: req.headers['user-agent'],
-            requestPayload: req.body,
-            responseStatus: 'FAILURE',
-            failureReason: error.message,
-        });
-
-        res.status(400).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-/**
- * POST /api/cards/redeem
+ * POST /cards/redeem
  * Redeem a QR card and credit points to user account
  *
  * Body: { token: string }
- * Requires authenticated user (req.user.id)
+ * Requires authentication
  */
-router.post('/redeem', async (req, res) => {
+router.post('/redeem', authenticate, async (req, res) => {
     const client = await pool.connect();
     const { token } = req.body;
-    const userId = req.user?.id; // Assumes auth middleware sets req.user
+    const userId = req.user.id;
     const ipAddress = getClientIP(req);
     const userAgent = req.headers['user-agent'];
 
@@ -143,22 +82,6 @@ router.post('/redeem', async (req, res) => {
         return res.status(400).json({
             success: false,
             error: 'Token is required',
-        });
-    }
-
-    if (!userId) {
-        await logAuditEvent({
-            eventType: 'CARD_REDEMPTION',
-            ipAddress,
-            userAgent,
-            requestPayload: { token: token.substring(0, 20) + '...' },
-            responseStatus: 'FAILURE',
-            failureReason: 'User not authenticated',
-        });
-
-        return res.status(401).json({
-            success: false,
-            error: 'Authentication required',
         });
     }
 
@@ -285,11 +208,12 @@ router.post('/redeem', async (req, res) => {
         }
 
         // Credit points to user account (atomic update)
+        // Use 'balance' column (updated in migration 002)
         const userUpdate = await client.query(
             `UPDATE users
-             SET points_balance = points_balance + $1
+             SET balance = balance + $1, updated_at = NOW()
              WHERE id = $2
-             RETURNING points_balance`,
+             RETURNING balance`,
             [card.value, userId]
         );
 
@@ -313,7 +237,7 @@ router.post('/redeem', async (req, res) => {
             });
         }
 
-        const newBalance = userUpdate.rows[0].points_balance;
+        const newBalance = userUpdate.rows[0].balance;
 
         // Mark card as used
         await client.query(
@@ -322,6 +246,9 @@ router.post('/redeem', async (req, res) => {
              WHERE id = $2`,
             [userId, card.id]
         );
+
+        // Record transaction
+        await recordCardRedemption(userId, card.value, card.id, newBalance, client);
 
         // Commit transaction
         await client.query('COMMIT');
@@ -366,142 +293,9 @@ router.post('/redeem', async (req, res) => {
 });
 
 /**
- * GET /api/cards/batch/:batchId
- * Get all cards from a specific batch
- */
-router.get('/batch/:batchId', async (req, res) => {
-    try {
-        const { batchId } = req.params;
-
-        const cards = await getCardsByBatch(batchId);
-
-        if (cards.length === 0) {
-            return res.status(404).json({
-                success: false,
-                error: 'Batch not found',
-            });
-        }
-
-        res.json({
-            success: true,
-            batchId,
-            count: cards.length,
-            cards,
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-/**
- * GET /api/cards/batch/:batchId/pdf
- * Download PDF of all cards in a batch
- */
-router.get('/batch/:batchId/pdf', async (req, res) => {
-    try {
-        const { batchId } = req.params;
-
-        const cards = await getCardsByBatch(batchId);
-
-        if (cards.length === 0) {
-            return res.status(404).json({
-                success: false,
-                error: 'Batch not found',
-            });
-        }
-
-        const pdfBuffer = await generateCardsPDF(cards);
-
-        res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader(
-            'Content-Disposition',
-            `attachment; filename="pointpay-cards-${batchId.substring(0, 8)}.pdf"`
-        );
-        res.setHeader('Content-Length', pdfBuffer.length);
-
-        res.send(pdfBuffer);
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-/**
- * POST /api/cards/:cardId/disable
- * Disable a specific card
- */
-router.post('/:cardId/disable', async (req, res) => {
-    try {
-        const { cardId } = req.params;
-
-        const disabled = await disableCard(cardId);
-
-        if (!disabled) {
-            return res.status(404).json({
-                success: false,
-                error: 'Card not found or already used/disabled',
-            });
-        }
-
-        await logAuditEvent({
-            eventType: 'CARD_DISABLED',
-            cardId,
-            ipAddress: getClientIP(req),
-            userAgent: req.headers['user-agent'],
-            responseStatus: 'SUCCESS',
-        });
-
-        res.json({
-            success: true,
-            message: 'Card disabled successfully',
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-/**
- * POST /api/cards/batch/:batchId/disable
- * Disable all cards in a batch
- */
-router.post('/batch/:batchId/disable', async (req, res) => {
-    try {
-        const { batchId } = req.params;
-
-        const disabledCount = await disableBatch(batchId);
-
-        await logAuditEvent({
-            eventType: 'BATCH_DISABLED',
-            ipAddress: getClientIP(req),
-            userAgent: req.headers['user-agent'],
-            responseStatus: 'SUCCESS',
-            metadata: { batchId, disabledCount },
-        });
-
-        res.json({
-            success: true,
-            message: `Disabled ${disabledCount} cards`,
-            disabledCount,
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-        });
-    }
-});
-
-/**
- * GET /api/cards/validate-only
+ * POST /cards/validate-only
  * Validate a token without redeeming (for preview/verification)
+ * Public endpoint - no authentication required
  */
 router.post('/validate-only', async (req, res) => {
     const { token } = req.body;

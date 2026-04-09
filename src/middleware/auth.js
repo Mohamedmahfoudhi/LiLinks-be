@@ -1,15 +1,11 @@
-/**
- * Sample authentication middleware
- * Replace this with your actual authentication implementation
- * (JWT, session-based, OAuth, etc.)
- */
+const { verifyAccessToken } = require('../services/authService');
+const { findById } = require('../services/userService');
 
 /**
- * Middleware to verify user authentication
+ * Middleware to verify user authentication via JWT
  * Sets req.user with user information if authenticated
  */
-function authenticate(req, res, next) {
-    // Example: Check for Bearer token in Authorization header
+async function authenticate(req, res, next) {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -22,26 +18,44 @@ function authenticate(req, res, next) {
     const token = authHeader.substring(7);
 
     try {
-        // TODO: Replace with your actual token verification logic
-        // Example with JWT:
-        // const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        // req.user = { id: decoded.userId, email: decoded.email };
+        const decoded = verifyAccessToken(token);
 
-        // Placeholder - in production, verify the token and get user from DB
-        if (token === 'test-token') {
-            req.user = {
-                id: '00000000-0000-0000-0000-000000000001',
-                email: 'test@example.com',
-            };
-        } else {
+        if (!decoded) {
             return res.status(401).json({
                 success: false,
                 error: 'Invalid or expired token',
             });
         }
 
+        // Fetch fresh user data from database
+        const user = await findById(decoded.userId);
+
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                error: 'User not found',
+            });
+        }
+
+        if (user.is_blocked) {
+            return res.status(403).json({
+                success: false,
+                error: 'Account is blocked',
+            });
+        }
+
+        req.user = {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+            phone: user.phone,
+            balance: user.balance,
+            isAdmin: user.is_admin,
+        };
+
         next();
     } catch (error) {
+        console.error('Authentication error:', error);
         return res.status(401).json({
             success: false,
             error: 'Authentication failed',
@@ -51,6 +65,7 @@ function authenticate(req, res, next) {
 
 /**
  * Middleware to check if user has admin role
+ * Must be used after authenticate middleware
  */
 function requireAdmin(req, res, next) {
     if (!req.user) {
@@ -60,7 +75,6 @@ function requireAdmin(req, res, next) {
         });
     }
 
-    // TODO: Replace with your actual admin check logic
     if (!req.user.isAdmin) {
         return res.status(403).json({
             success: false,
@@ -73,8 +87,9 @@ function requireAdmin(req, res, next) {
 
 /**
  * Optional authentication - sets req.user if token is valid, but doesn't fail
+ * Useful for endpoints that have different behavior for authenticated users
  */
-function optionalAuth(req, res, next) {
+async function optionalAuth(req, res, next) {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -85,14 +100,30 @@ function optionalAuth(req, res, next) {
     const token = authHeader.substring(7);
 
     try {
-        // TODO: Replace with your actual token verification
-        // Placeholder implementation
-        req.user = null;
-        next();
+        const decoded = verifyAccessToken(token);
+
+        if (decoded) {
+            const user = await findById(decoded.userId);
+            if (user && !user.is_blocked) {
+                req.user = {
+                    id: user.id,
+                    email: user.email,
+                    name: user.name,
+                    phone: user.phone,
+                    balance: user.balance,
+                    isAdmin: user.is_admin,
+                };
+            } else {
+                req.user = null;
+            }
+        } else {
+            req.user = null;
+        }
     } catch {
         req.user = null;
-        next();
     }
+
+    next();
 }
 
 module.exports = {

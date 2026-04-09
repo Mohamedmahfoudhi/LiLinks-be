@@ -19,6 +19,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    container_name: pointpay-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes
+
   api:
     build: .
     container_name: pointpay-api
@@ -34,10 +48,22 @@ services:
       DB_PASSWORD: postgres123
       DB_POOL_SIZE: 20
       QR_SECRET: super_secret_hmac_key_change_in_production_abc123
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_ACCESS_SECRET: change_this_jwt_access_secret_in_production
+      JWT_REFRESH_SECRET: change_this_jwt_refresh_secret_in_production
+      JWT_ACCESS_EXPIRES: 15m
+      JWT_REFRESH_EXPIRES: 7d
+      BCRYPT_ROUNDS: 12
+      OTP_TTL_SECONDS: 300
+      OTP_MAX_ATTEMPTS: 3
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:
